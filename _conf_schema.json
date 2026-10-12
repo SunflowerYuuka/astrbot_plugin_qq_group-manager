@@ -74,15 +74,28 @@
   },
   "farewell_prompt": {
     "description": "送辞提示词 (LLM)",
-    "hint": "可用变量：{user_id}, {group_id}",
+    "hint": "可用变量：{user_id}, {group_id}, {member_name}",
     "type": "string",
-    "default": "有一个成员（QQ号：{user_id}）退出了群聊（群号：{group_id}），请你用简短、惋惜的话语告别，字数控制在50字以内。"
+    "default": "有一个成员（名称：{member_name}，QQ号：{user_id}）退出了群聊（群号：{group_id}），请你用简短、惋惜的话语告别，字数控制在50字以内。"
   },
   "farewell_fallback": {
     "description": "送辞备用文本 (兜底)",
     "hint": "当所有大模型都报错时，直接发送此文本。可用变量：{user_id}, {group_id}",
     "type": "string",
     "default": "有缘再见。"
+  },
+  "member_card_cache_enable": {
+    "description": "开启群成员名片缓存",
+    "hint": "关闭时送辞使用 QQ 昵称；开启后首次收到群事件时会自动同步管理群的成员名片。",
+    "type": "bool",
+    "default": false
+  },
+  "member_card_cache_refresh_interval": {
+    "description": "群成员名片缓存刷新间隔（分钟）",
+    "hint": "开启缓存后，按此间隔全量刷新管理群成员名片，最小为 1 分钟。",
+    "type": "int",
+    "default": 60,
+    "min": 1
   },
   "filter_list_mode": {
     "description": "名单模式",

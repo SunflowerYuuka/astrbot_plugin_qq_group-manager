@@ -6,6 +6,39 @@ from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger
 
+
+def build_at_message(user_id, text: str) -> list:
+    return [
+        {"type": "at", "data": {"qq": str(user_id)}},
+        {"type": "text", "data": {"text": f" {text}"}},
+    ]
+
+
+def get_member_display_name(member_info: dict, user_id) -> str:
+    card = str(member_info.get("card", "")).strip()
+    if card:
+        return card
+
+    nickname = str(member_info.get("nickname", "")).strip()
+    if nickname:
+        return nickname
+
+    return str(user_id)
+
+
+def build_farewell_prompt(prompt_template: str, user_id, group_id, member_name: str) -> str:
+    prompt = prompt_template.format(
+        user_id=user_id,
+        group_id=group_id,
+        member_name=member_name,
+    )
+    return (
+        f"{prompt}\n\n"
+        f"补充上下文：成员名称为“{member_name}”，QQ号为“{user_id}”，"
+        "该成员已经离开这个群聊。请根据上下文自然生成送辞内容。"
+    )
+
+
 @register("QQ_Group_Manager", "SunflowerYuuka", "QQ群管家插件：自动处理入群申请、调用LLM迎新送辞、邀请进群审核", "v1.2.0")
 class GroupManager(Star):
     def __init__(self, context: Context, config: dict = None):
@@ -14,7 +47,13 @@ class GroupManager(Star):
         
         data_dir = StarTools.get_data_dir()
         self.pending_file = data_dir / "pending_invites.json"
+        self.member_card_cache_file = data_dir / "member_card_cache.json"
         self.pending_invites = self._load_pending()
+        self.member_card_cache = self._load_member_card_cache()
+        self._member_card_cache_enabled = False
+        self._member_card_cache_task = None
+        self._member_card_cache_lock = asyncio.Lock()
+        self._member_card_cache_dirty = False
         
         self._background_tasks = set()
         
@@ -35,6 +74,175 @@ class GroupManager(Star):
                 json.dump(self.pending_invites, f, ensure_ascii=False, indent=2)
         except Exception as e:
             logger.error(f"[QQ群管家] 保存待审核记录失败: {e}")
+
+    def _load_member_card_cache(self) -> dict:
+        if self.member_card_cache_file.exists():
+            try:
+                with open(self.member_card_cache_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    return data if isinstance(data, dict) else {}
+            except Exception as e:
+                logger.error(f"[QQ群管家] 读取群成员名片缓存失败: {e}")
+        return {}
+
+    def _save_member_card_cache(self):
+        try:
+            with open(self.member_card_cache_file, "w", encoding="utf-8") as f:
+                json.dump(self.member_card_cache, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.error(f"[QQ群管家] 保存群成员名片缓存失败: {e}")
+
+    def _get_config(self) -> dict:
+        config = self.get_config() if hasattr(self, "get_config") else self.config
+        return config or self.config
+
+    @staticmethod
+    def _action_data(response):
+        if isinstance(response, dict) and "data" in response:
+            return response["data"]
+        return response
+
+    async def _refresh_member_card_cache_unlocked(self, bot, config: dict):
+        group_response = await bot.api.call_action("get_group_list")
+        groups = self._action_data(group_response) or []
+        if not isinstance(groups, list):
+            logger.warning("[QQ群管家] 获取群列表返回格式异常，跳过名片缓存刷新。")
+            return
+
+        refreshed_cache = {}
+        for group in groups:
+            if not isinstance(group, dict):
+                continue
+            group_id = group.get("group_id")
+            if group_id is None or not self._is_group_managed(group_id, config):
+                continue
+
+            try:
+                member_response = await bot.api.call_action(
+                    "get_group_member_list", group_id=group_id
+                )
+                members = self._action_data(member_response) or []
+                if not isinstance(members, list):
+                    raise ValueError("成员列表返回格式异常")
+
+                group_cache = dict(self.member_card_cache.get(str(group_id), {}))
+                for member in members:
+                    if not isinstance(member, dict) or member.get("user_id") is None:
+                        continue
+                    user_id = str(member["user_id"])
+                    group_cache[user_id] = {
+                        "card": str(member.get("card", "") or ""),
+                        "nickname": str(member.get("nickname", "") or ""),
+                    }
+                refreshed_cache[str(group_id)] = group_cache
+            except Exception as e:
+                logger.warning(f"[QQ群管家] 刷新群 {group_id} 的成员名片缓存失败: {e}")
+                previous_group_cache = self.member_card_cache.get(str(group_id))
+                if previous_group_cache is not None:
+                    refreshed_cache[str(group_id)] = previous_group_cache
+
+        self.member_card_cache = refreshed_cache
+        self._save_member_card_cache()
+        self._member_card_cache_dirty = False
+        logger.info(f"[QQ群管家] 群成员名片缓存刷新完成，共 {len(refreshed_cache)} 个群。")
+
+    async def _refresh_member_card_cache(self, bot, config: dict):
+        async with self._member_card_cache_lock:
+            await self._refresh_member_card_cache_unlocked(bot, config)
+
+    async def _member_card_cache_loop(self, bot):
+        try:
+            while self._member_card_cache_enabled:
+                config = self._get_config()
+                if not config.get("member_card_cache_enable", False):
+                    self._member_card_cache_enabled = False
+                    break
+
+                interval = max(1, int(config.get("member_card_cache_refresh_interval", 60)))
+                await asyncio.sleep(interval * 60)
+                if self._member_card_cache_enabled:
+                    try:
+                        await self._refresh_member_card_cache(bot, config)
+                    except Exception as e:
+                        logger.error(f"[QQ群管家] 定时刷新群成员名片缓存失败: {e}")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error(f"[QQ群管家] 群成员名片缓存后台刷新失败: {e}")
+        finally:
+            if self._member_card_cache_task is asyncio.current_task():
+                self._member_card_cache_task = None
+
+    async def _ensure_member_card_cache(self, bot, config: dict):
+        enabled = bool(config.get("member_card_cache_enable", False))
+        if not enabled:
+            async with self._member_card_cache_lock:
+                self._member_card_cache_enabled = False
+                task = self._member_card_cache_task
+                self._member_card_cache_task = None
+                if task and not task.done():
+                    task.cancel()
+            if task and not task.done():
+                await asyncio.gather(task, return_exceptions=True)
+            return
+
+        async with self._member_card_cache_lock:
+            if self._member_card_cache_enabled and self._member_card_cache_task:
+                return
+
+            self._member_card_cache_enabled = True
+            try:
+                await self._refresh_member_card_cache_unlocked(bot, config)
+            except Exception as e:
+                logger.error(f"[QQ群管家] 首次刷新群成员名片缓存失败: {e}")
+            self._member_card_cache_task = asyncio.create_task(
+                self._member_card_cache_loop(bot)
+            )
+
+    def _get_cached_member_info(self, group_id, user_id) -> dict:
+        group_cache = self.member_card_cache.get(str(group_id), {})
+        return group_cache.get(str(user_id), {})
+
+    async def _get_member_nickname(self, bot, user_id) -> str:
+        try:
+            response = await bot.api.call_action(
+                "get_stranger_info", user_id=user_id
+            )
+            info = self._action_data(response)
+            if isinstance(info, dict):
+                nickname = str(info.get("nickname") or "").strip()
+                if nickname:
+                    return nickname
+        except Exception as e:
+            logger.warning(f"[QQ群管家] 获取 QQ {user_id} 昵称失败: {e}")
+        return str(user_id)
+
+    async def _get_farewell_member_name(self, bot, group_id, user_id, config: dict) -> str:
+        if config.get("member_card_cache_enable", False):
+            cached_info = self._get_cached_member_info(group_id, user_id)
+            if cached_info:
+                member_name = get_member_display_name(cached_info, user_id)
+                if member_name != str(user_id):
+                    return member_name
+
+        return await self._get_member_nickname(bot, user_id)
+
+    async def terminate(self):
+        tasks = []
+        async with self._member_card_cache_lock:
+            self._member_card_cache_enabled = False
+            if self._member_card_cache_task and not self._member_card_cache_task.done():
+                self._member_card_cache_task.cancel()
+                tasks.append(self._member_card_cache_task)
+            self._member_card_cache_task = None
+            if self._member_card_cache_dirty:
+                self._save_member_card_cache()
+        for task in self._background_tasks:
+            if not task.done():
+                task.cancel()
+                tasks.append(task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     def _is_group_managed(self, group_id: int, config: dict) -> bool:
         list_mode = config.get("filter_list_mode", "黑名单")
@@ -118,9 +326,7 @@ class GroupManager(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_group_events(self, event: AstrMessageEvent):
-        config = self.get_config() if hasattr(self, "get_config") else self.config
-        if not config:
-            config = self.config
+        config = self._get_config()
             
         if not hasattr(event, "message_obj"):
             return
@@ -129,6 +335,35 @@ class GroupManager(Star):
             return
 
         post_type = raw_msg.get("post_type")
+        group_id = raw_msg.get("group_id")
+        is_group_event = group_id is not None and (
+            raw_msg.get("message_type") == "group"
+            or (
+                post_type in ("notice", "request")
+                and raw_msg.get("request_type", "group") == "group"
+            )
+        )
+        is_managed_group = is_group_event and self._is_group_managed(group_id, config)
+
+        if (
+            is_managed_group
+            and raw_msg.get("message_type") == "group"
+            and config.get("member_card_cache_enable", False)
+        ):
+            sender = raw_msg.get("sender") or {}
+            sender_id = sender.get("user_id")
+            if sender_id is not None:
+                async with self._member_card_cache_lock:
+                    self.member_card_cache.setdefault(str(group_id), {})[
+                        str(sender_id)
+                    ] = {
+                        "card": str(sender.get("card", "") or ""),
+                        "nickname": str(sender.get("nickname", "") or ""),
+                    }
+                    self._member_card_cache_dirty = True
+
+        if is_managed_group:
+            await self._ensure_member_card_cache(event.bot, config)
         
         if post_type == "request" and raw_msg.get("request_type") == "group":
             sub_type = raw_msg.get("sub_type")
@@ -230,7 +465,7 @@ class GroupManager(Star):
                 await event.bot.api.call_action(
                     "send_group_msg",
                     group_id=group_id,
-                    message=f"[CQ:at,qq={user_id}] {welcome_msg}"
+                    message=build_at_message(user_id, welcome_msg)
                 )
             except Exception as e:
                 logger.error(f"[QQ群管家] 发送迎新消息失败: {e}")
@@ -244,7 +479,12 @@ class GroupManager(Star):
 
         if config.get("farewell_enable", True):
             prompt_template = config.get("farewell_prompt", "")
-            prompt = prompt_template.format(user_id=user_id, group_id=group_id)
+            member_name = await self._get_farewell_member_name(
+                event.bot, group_id, user_id, config
+            )
+            prompt = build_farewell_prompt(
+                prompt_template, user_id, group_id, member_name
+            )
             
             farewell_msg = await self._generate_llm_response(prompt, group_id, config)
             if not farewell_msg:
