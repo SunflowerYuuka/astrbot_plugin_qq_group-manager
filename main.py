@@ -39,7 +39,7 @@ def build_farewell_prompt(prompt_template: str, user_id, group_id, member_name: 
     )
 
 
-@register("QQ_Group_Manager", "SunflowerYuuka", "QQ群管家插件：自动处理入群申请、调用LLM迎新送辞、邀请进群审核", "v1.3.0")
+@register("QQ_Group_Manager", "SunflowerYuuka", "QQ群管家插件：自动处理入群申请、调用LLM迎新送辞、邀请进群审核", "v1.3.1")
 class GroupManager(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
