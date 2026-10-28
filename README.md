@@ -1,5 +1,7 @@
 ![:name](https://count.getloli.com/@astrbot_plugin_group_manager?name=astrbot_plugin_group_manager&theme=miku&padding=7&offset=0&align=top&scale=1&pixelated=1&darkmode=auto)
 
+<p align="center"><img src="logo.png" width="180" alt="QQ群管家 Logo"></p>
+
 ### Astrbot_Plugin_QQ_Group_Manage
 ### 一款 QQ 群管家插件，支持自动同意加群、LLM 智能迎新送辞、以及机器人进群邀请的管理员审核。
 
@@ -10,7 +12,7 @@
 
 ### AI 制作声明
 
-本插件由 AI 辅助制作。功能实现、文案和文档可能存在疏漏，使用前请自行评估，如有问题欢迎反馈。
+本插件由 AI 辅助制作，插件图标由即梦 AI 生成。功能实现、文案和文档可能存在疏漏，使用前请自行评估，如有问题欢迎反馈。
 
 ### 兼容性说明
 
