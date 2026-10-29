@@ -1,6 +1,7 @@
 name: astrbot_plugin_qq_group_manager
 display_name: QQ群管家
 description: 一款由 AI 辅助制作的 QQ 群管家插件，支持自动同意加群、LLM 智能迎新送辞、以及机器人进群邀请的管理员审核。
-version: 'v1.3.2'
+version: 'v1.4.0'
 author: SunflowerYuuka
+astrbot_version: ">=4.20.0,<5"
 repo: https://github.com/SunflowerYuuka/astrbot_plugin_qq_group-manager

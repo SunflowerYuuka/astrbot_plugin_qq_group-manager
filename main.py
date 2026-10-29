@@ -1,10 +1,32 @@
 import json
 import asyncio
+import os
+import re
+import time
 import uuid
 import inspect
 from astrbot.api.event import filter, AstrMessageEvent
 from astrbot.api.star import Context, Star, register, StarTools
 from astrbot.api import logger
+
+INVITE_TIMEOUT_SECONDS = 24 * 3600
+CACHE_TTL_SECONDS = 7 * 24 * 3600
+_PLACEHOLDER_PATTERN = re.compile(
+    r"(?<!\{)\{([A-Za-z_][A-Za-z0-9_]*)\}(?!\})"
+)
+
+
+def safe_format(template: str, **values) -> str:
+    if not template:
+        return ""
+
+    def replace(match):
+        key = match.group(1)
+        if key in values:
+            return str(values[key])
+        return match.group(0)
+
+    return _PLACEHOLDER_PATTERN.sub(replace, str(template))
 
 
 def build_at_message(user_id, text: str) -> list:
@@ -27,7 +49,8 @@ def get_member_display_name(member_info: dict, user_id) -> str:
 
 
 def build_farewell_prompt(prompt_template: str, user_id, group_id, member_name: str) -> str:
-    prompt = prompt_template.format(
+    prompt = safe_format(
+        prompt_template,
         user_id=user_id,
         group_id=group_id,
         member_name=member_name,
@@ -39,7 +62,7 @@ def build_farewell_prompt(prompt_template: str, user_id, group_id, member_name: 
     )
 
 
-@register("QQ_Group_Manager", "SunflowerYuuka", "QQ群管家插件（AI 辅助制作）：自动处理入群申请、调用LLM迎新送辞、邀请进群审核", "v1.3.2")
+@register("QQ_Group_Manager", "SunflowerYuuka", "QQ群管家插件（AI 辅助制作）：自动处理入群申请、调用LLM迎新送辞、邀请进群审核", "v1.4.0")
 class GroupManager(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -54,8 +77,10 @@ class GroupManager(Star):
         self._member_card_cache_task = None
         self._member_card_cache_lock = asyncio.Lock()
         self._member_card_cache_dirty = False
-        
+        self._timeouts_started = False
+
         self._background_tasks = set()
+        self._timeout_tasks = {}
         
         logger.info(f"[QQ群管家] 插件加载成功，当前待审核邀请数: {len(self.pending_invites)}")
 
@@ -63,15 +88,46 @@ class GroupManager(Star):
         if self.pending_file.exists():
             try:
                 with open(self.pending_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    data = json.load(f)
             except Exception as e:
                 logger.error(f"[QQ群管家] 读取待审核记录失败: {e}")
+                return {}
+
+            if not isinstance(data, dict):
+                logger.warning("[QQ群管家] 待审核记录格式异常，已忽略。")
+                return {}
+
+            valid = {}
+            for invite_id, invite in data.items():
+                if not isinstance(invite, dict):
+                    continue
+                if not all(invite.get(key) for key in ("flag", "user_id", "group_id")):
+                    continue
+                valid[str(invite_id)] = invite
+            return valid
         return {}
+
+    def _atomic_write_json(self, path, data):
+        tmp_path = path.with_name(
+            f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
+        )
+        try:
+            with open(tmp_path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, path)
+        except Exception:
+            try:
+                if tmp_path.exists():
+                    tmp_path.unlink()
+            except Exception:
+                pass
+            raise
 
     def _save_pending(self):
         try:
-            with open(self.pending_file, "w", encoding="utf-8") as f:
-                json.dump(self.pending_invites, f, ensure_ascii=False, indent=2)
+            self._atomic_write_json(self.pending_file, self.pending_invites)
         except Exception as e:
             logger.error(f"[QQ群管家] 保存待审核记录失败: {e}")
 
@@ -87,8 +143,7 @@ class GroupManager(Star):
 
     def _save_member_card_cache(self):
         try:
-            with open(self.member_card_cache_file, "w", encoding="utf-8") as f:
-                json.dump(self.member_card_cache, f, ensure_ascii=False, indent=2)
+            self._atomic_write_json(self.member_card_cache_file, self.member_card_cache)
         except Exception as e:
             logger.error(f"[QQ群管家] 保存群成员名片缓存失败: {e}")
 
@@ -102,13 +157,72 @@ class GroupManager(Star):
             return response["data"]
         return response
 
-    async def _refresh_member_card_cache_unlocked(self, bot, config: dict):
-        group_response = await bot.api.call_action("get_group_list")
-        groups = self._action_data(group_response) or []
-        if not isinstance(groups, list):
-            logger.warning("[QQ群管家] 获取群列表返回格式异常，跳过名片缓存刷新。")
-            return
+    @staticmethod
+    def _prune_group_cache(group_cache, now) -> dict:
+        pruned = {}
+        if not isinstance(group_cache, dict):
+            return pruned
+        for member_id, info in group_cache.items():
+            if not isinstance(info, dict):
+                continue
+            try:
+                last_seen = float(info.get("last_seen") or 0)
+            except (TypeError, ValueError):
+                last_seen = 0
+            if now - last_seen <= CACHE_TTL_SECONDS:
+                pruned[str(member_id)] = {
+                    "card": str(info.get("card") or ""),
+                    "nickname": str(info.get("nickname") or ""),
+                    "last_seen": last_seen,
+                }
+        return pruned
 
+    @staticmethod
+    def _merge_newer_entries(target: dict, source: dict, now=None):
+        now = time.time() if now is None else now
+        for group_id, members in (source or {}).items():
+            if not isinstance(members, dict):
+                continue
+            group_key = str(group_id)
+            if group_key not in target:
+                continue
+            target_group = target[group_key]
+            for user_id, info in members.items():
+                if not isinstance(info, dict):
+                    continue
+                try:
+                    new_seen = float(info.get("last_seen") or 0)
+                except (TypeError, ValueError):
+                    new_seen = 0
+                if now - new_seen > CACHE_TTL_SECONDS:
+                    continue
+                existing = target_group.get(str(user_id))
+                try:
+                    old_seen = float(existing.get("last_seen") or 0) if isinstance(existing, dict) else -1
+                except (TypeError, ValueError):
+                    old_seen = -1
+                if existing is None or new_seen >= old_seen:
+                    target_group[str(user_id)] = info
+
+    async def _build_member_card_snapshot(self, bot, config: dict):
+        now = time.time()
+        try:
+            group_response = await bot.api.call_action("get_group_list")
+            groups = self._action_data(group_response) or []
+            if not isinstance(groups, list):
+                raise ValueError("群列表返回格式异常")
+        except Exception as e:
+            logger.warning(f"[QQ群管家] 获取群列表失败，跳过名片缓存刷新: {e}")
+            async with self._member_card_cache_lock:
+                self.member_card_cache = {
+                    group_id: self._prune_group_cache(members, now)
+                    for group_id, members in self.member_card_cache.items()
+                }
+                self._member_card_cache_dirty = False
+            self._save_member_card_cache()
+            return None
+
+        previous_cache = self.member_card_cache
         refreshed_cache = {}
         for group in groups:
             if not isinstance(group, dict):
@@ -117,6 +231,8 @@ class GroupManager(Star):
             if group_id is None or not self._is_group_managed(group_id, config):
                 continue
 
+            group_key = str(group_id)
+            previous_group_cache = previous_cache.get(group_key, {})
             try:
                 member_response = await bot.api.call_action(
                     "get_group_member_list", group_id=group_id
@@ -125,30 +241,37 @@ class GroupManager(Star):
                 if not isinstance(members, list):
                     raise ValueError("成员列表返回格式异常")
 
-                group_cache = dict(self.member_card_cache.get(str(group_id), {}))
+                group_cache = self._prune_group_cache(previous_group_cache, now)
                 for member in members:
                     if not isinstance(member, dict) or member.get("user_id") is None:
                         continue
                     user_id = str(member["user_id"])
                     group_cache[user_id] = {
-                        "card": str(member.get("card", "") or ""),
-                        "nickname": str(member.get("nickname", "") or ""),
+                        "card": str(member.get("card") or ""),
+                        "nickname": str(member.get("nickname") or ""),
+                        "last_seen": now,
                     }
-                refreshed_cache[str(group_id)] = group_cache
+                refreshed_cache[group_key] = group_cache
             except Exception as e:
                 logger.warning(f"[QQ群管家] 刷新群 {group_id} 的成员名片缓存失败: {e}")
-                previous_group_cache = self.member_card_cache.get(str(group_id))
-                if previous_group_cache is not None:
-                    refreshed_cache[str(group_id)] = previous_group_cache
-
-        self.member_card_cache = refreshed_cache
-        self._save_member_card_cache()
-        self._member_card_cache_dirty = False
-        logger.info(f"[QQ群管家] 群成员名片缓存刷新完成，共 {len(refreshed_cache)} 个群。")
+                if previous_group_cache:
+                    refreshed_cache[group_key] = self._prune_group_cache(
+                        previous_group_cache, now
+                    )
+        return refreshed_cache
 
     async def _refresh_member_card_cache(self, bot, config: dict):
+        refreshed_cache = await self._build_member_card_snapshot(bot, config)
+        if refreshed_cache is None:
+            return
         async with self._member_card_cache_lock:
-            await self._refresh_member_card_cache_unlocked(bot, config)
+            self._merge_newer_entries(refreshed_cache, self.member_card_cache)
+            self.member_card_cache = refreshed_cache
+            self._member_card_cache_dirty = False
+        self._save_member_card_cache()
+        logger.info(
+            f"[QQ群管家] 群成员名片缓存刷新完成，共 {len(refreshed_cache)} 个群。"
+        )
 
     async def _member_card_cache_loop(self, bot):
         try:
@@ -173,6 +296,17 @@ class GroupManager(Star):
             if self._member_card_cache_task is asyncio.current_task():
                 self._member_card_cache_task = None
 
+    async def _member_card_cache_runner(self, bot):
+        try:
+            try:
+                await self._refresh_member_card_cache(bot, self._get_config())
+            except Exception as e:
+                logger.error(f"[QQ群管家] 首次刷新群成员名片缓存失败: {e}")
+            await self._member_card_cache_loop(bot)
+        finally:
+            if self._member_card_cache_task is asyncio.current_task():
+                self._member_card_cache_task = None
+
     async def _ensure_member_card_cache(self, bot, config: dict):
         enabled = bool(config.get("member_card_cache_enable", False))
         if not enabled:
@@ -180,9 +314,8 @@ class GroupManager(Star):
                 self._member_card_cache_enabled = False
                 task = self._member_card_cache_task
                 self._member_card_cache_task = None
-                if task and not task.done():
-                    task.cancel()
             if task and not task.done():
+                task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
             return
 
@@ -191,12 +324,8 @@ class GroupManager(Star):
                 return
 
             self._member_card_cache_enabled = True
-            try:
-                await self._refresh_member_card_cache_unlocked(bot, config)
-            except Exception as e:
-                logger.error(f"[QQ群管家] 首次刷新群成员名片缓存失败: {e}")
             self._member_card_cache_task = asyncio.create_task(
-                self._member_card_cache_loop(bot)
+                self._member_card_cache_runner(bot)
             )
 
     def _get_cached_member_info(self, group_id, user_id) -> dict:
@@ -260,69 +389,171 @@ class GroupManager(Star):
 
     @filter.command("bot_join")
     async def handle_bot_join(self, event: AstrMessageEvent, invite_id: str, decision: str):
-        config = self.get_config() if hasattr(self, "get_config") else self.config
-        if not config:
-            config = self.config
+        config = self._get_config()
 
         sender_id = str(event.get_sender_id())
-        admin_qqs = [q.strip() for q in config.get("admin_qq", "").split(",") if q.strip()]
-        
+        admin_qqs = [
+            q.strip() for q in (config.get("admin_qq") or "").split(",") if q.strip()
+        ]
+
         if sender_id not in admin_qqs:
             yield event.plain_result("您没有权限执行此操作，请在 WebUI 中配置管理员 QQ。")
             return
 
-        self.pending_invites = self._load_pending()
         if invite_id not in self.pending_invites:
             yield event.plain_result(f"找不到 ID 为 {invite_id} 的待审核记录，可能已处理或已超时。")
             return
 
         invite = self.pending_invites[invite_id]
-        flag = invite["flag"]
-        user_id = invite["user_id"]
-        group_id = invite["group_id"]
+        flag = invite.get("flag")
+        user_id = invite.get("user_id")
+        group_id = invite.get("group_id")
 
         if decision not in ["同意", "拒绝"]:
             yield event.plain_result("指令格式错误。正确用法: /bot_join <审核ID> <同意/拒绝>")
             return
 
+        if not all((flag, user_id, group_id)):
+            self.pending_invites.pop(invite_id, None)
+            self._save_pending()
+            yield event.plain_result("该审核记录不完整，已清理，请重新邀请。")
+            return
+
+        if invite.get("processing"):
+            yield event.plain_result("该邀请正在处理中，请稍候。")
+            return
+
+        invite["processing"] = True
         approve = (decision == "同意")
+        status_str = "同意" if approve else "拒绝"
 
         try:
-            await event.bot.api.call_action("set_group_add_request", flag=flag, sub_type="invite", approve=approve)
-            
-            status_str = "同意" if approve else "拒绝"
+            await event.bot.api.call_action(
+                "set_group_add_request", flag=flag, sub_type="invite", approve=approve
+            )
+        except asyncio.CancelledError:
+            invite.pop("processing", None)
+            raise
+        except Exception as e:
+            invite.pop("processing", None)
+            yield event.plain_result(f"操作失败，可能是请求已过期: {e}")
+            return
+
+        self.pending_invites.pop(invite_id, None)
+        self._save_pending()
+        self._cancel_timeout(invite_id)
+
+        notify_ok = True
+        try:
             await event.bot.api.call_action(
                 "send_private_msg",
                 user_id=user_id,
-                message=f"您邀请我加入群聊 {group_id} 的请求已被管理员【{status_str}】。"
+                message=f"您邀请我加入群聊 {group_id} 的请求已被管理员【{status_str}】。",
             )
-            
-            del self.pending_invites[invite_id]
-            self._save_pending()
-            
-            yield event.plain_result(f"已【{status_str}】该邀请，并已私聊通知邀请人。")
-            
         except Exception as e:
-            yield event.plain_result(f"操作失败，可能是请求已过期: {e}")
+            notify_ok = False
+            logger.warning(f"[QQ群管家] 私聊通知邀请人失败: {e}")
+
+        if notify_ok:
+            yield event.plain_result(f"已【{status_str}】该邀请，并已私聊通知邀请人。")
+        else:
+            yield event.plain_result(f"已【{status_str}】该邀请，但私聊通知邀请人失败。")
+
+    def _schedule_timeout(self, invite_id: str, bot):
+        existing = self._timeout_tasks.get(invite_id)
+        if existing and not existing.done():
+            return
+
+        task = asyncio.create_task(self._timeout_task(invite_id, bot))
+        self._timeout_tasks[invite_id] = task
+        self._background_tasks.add(task)
+
+        def cleanup(done_task):
+            self._background_tasks.discard(done_task)
+            if self._timeout_tasks.get(invite_id) is done_task:
+                self._timeout_tasks.pop(invite_id, None)
+
+        task.add_done_callback(cleanup)
+
+    def _cancel_timeout(self, invite_id: str):
+        task = self._timeout_tasks.pop(invite_id, None)
+        if task and not task.done():
+            task.cancel()
+
+    async def _ensure_pending_timeouts(self, bot):
+        if self._timeouts_started:
+            return
+        self._timeouts_started = True
+        for invite_id in list(self.pending_invites):
+            self._schedule_timeout(invite_id, bot)
 
     async def _timeout_task(self, invite_id: str, bot):
-        await asyncio.sleep(24 * 3600)
-        
-        self.pending_invites = self._load_pending()
-        if invite_id in self.pending_invites:
-            invite = self.pending_invites[invite_id]
+        while True:
+            invite = self.pending_invites.get(invite_id)
+            if not invite:
+                return
+
+            if invite.get("processing"):
+                await asyncio.sleep(60)
+                continue
+
             try:
-                await bot.api.call_action("set_group_add_request", flag=invite["flag"], sub_type="invite", approve=False)
+                created_at = float(invite.get("created_at") or time.time())
+            except (TypeError, ValueError):
+                created_at = time.time()
+
+            delay = created_at + INVITE_TIMEOUT_SECONDS - time.time()
+            if delay > 0:
+                await asyncio.sleep(delay)
+                continue
+
+            invite["processing"] = True
+            try:
+                await bot.api.call_action(
+                    "set_group_add_request",
+                    flag=invite["flag"],
+                    sub_type="invite",
+                    approve=False,
+                )
+            except asyncio.CancelledError:
+                invite.pop("processing", None)
+                raise
+            except Exception as e:
+                invite.pop("processing", None)
+                attempts = int(invite.get("timeout_attempts") or 0) + 1
+                if attempts >= 3:
+                    self.pending_invites.pop(invite_id, None)
+                    self._save_pending()
+                    logger.error(
+                        f"[QQ群管家] 邀请 {invite_id} 连续 {attempts} 次超时拒绝失败，"
+                        f"已清理记录: {e}"
+                    )
+                    return
+                invite["timeout_attempts"] = attempts
+                self._save_pending()
+                logger.error(
+                    f"[QQ群管家] 邀请 {invite_id} 超时自动拒绝失败"
+                    f"（第 {attempts} 次），稍后重试: {e}"
+                )
+                await asyncio.sleep(300)
+                continue
+
+            self.pending_invites.pop(invite_id, None)
+            self._save_pending()
+            logger.info(f"[QQ群管家] 邀请 {invite_id} 已超时，自动拒绝成功。")
+
+            try:
                 await bot.api.call_action(
                     "send_private_msg",
                     user_id=invite["user_id"],
-                    message=f"您邀请我加入群聊 {invite['group_id']} 的请求已超时（24小时未审核），系统已自动拒绝。"
+                    message=(
+                        f"您邀请我加入群聊 {invite['group_id']} 的请求已超时"
+                        "（24小时未审核），系统已自动拒绝。"
+                    ),
                 )
-                del self.pending_invites[invite_id]
-                self._save_pending()
-                logger.info(f"[QQ群管家] 邀请 {invite_id} 已超时，自动拒绝成功。")
             except Exception as e:
-                logger.error(f"[QQ群管家] 超时自动拒绝失败: {e}")
+                logger.warning(f"[QQ群管家] 超时通知邀请人失败: {e}")
+            return
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def handle_group_events(self, event: AstrMessageEvent):
@@ -333,6 +564,8 @@ class GroupManager(Star):
         raw_msg = getattr(event.message_obj, "raw_message", None)
         if not raw_msg or not isinstance(raw_msg, dict):
             return
+
+        await self._ensure_pending_timeouts(event.bot)
 
         post_type = raw_msg.get("post_type")
         group_id = raw_msg.get("group_id")
@@ -353,14 +586,14 @@ class GroupManager(Star):
             sender = raw_msg.get("sender") or {}
             sender_id = sender.get("user_id")
             if sender_id is not None:
-                async with self._member_card_cache_lock:
-                    self.member_card_cache.setdefault(str(group_id), {})[
-                        str(sender_id)
-                    ] = {
-                        "card": str(sender.get("card", "") or ""),
-                        "nickname": str(sender.get("nickname", "") or ""),
-                    }
-                    self._member_card_cache_dirty = True
+                self.member_card_cache.setdefault(str(group_id), {})[
+                    str(sender_id)
+                ] = {
+                    "card": str(sender.get("card") or ""),
+                    "nickname": str(sender.get("nickname") or ""),
+                    "last_seen": time.time(),
+                }
+                self._member_card_cache_dirty = True
 
         if is_managed_group:
             await self._ensure_member_card_cache(event.bot, config)
@@ -401,28 +634,38 @@ class GroupManager(Star):
         user_id = raw_msg.get("user_id")
         group_id = raw_msg.get("group_id")
 
+        if not all((flag, user_id, group_id)):
+            logger.warning("[QQ群管家] 收到字段不完整的进群邀请，已忽略。")
+            return
+
         invite_id = uuid.uuid4().hex[:6]
         self.pending_invites[invite_id] = {
             "flag": flag,
             "user_id": user_id,
-            "group_id": group_id
+            "group_id": group_id,
+            "created_at": time.time(),
         }
         self._save_pending()
 
-        prompt_template = config.get("invite_prompt", "我已收到您邀请我加入群聊（群号：{group_id}）的请求，我已经通知我的管理员啦，请耐心等待管理员审核哦~")
-        prompt = prompt_template.format(user_id=user_id, group_id=group_id)
-        
-        llm_msg = await self._generate_llm_response(prompt, group_id, config)
+        prompt_template = config.get(
+            "invite_prompt",
+            "我已收到您邀请我加入群聊（群号：{group_id}）的请求，我已经通知我的管理员啦，请耐心等待管理员审核哦~",
+        )
+        prompt = safe_format(prompt_template, user_id=user_id, group_id=group_id)
+
+        llm_msg = await self._generate_llm_response(prompt, group_id, config, event)
         if not llm_msg:
             fallback_template = config.get("invite_fallback", "已通知管理员，请等待审核。")
-            llm_msg = fallback_template.format(user_id=user_id, group_id=group_id)
+            llm_msg = safe_format(fallback_template, user_id=user_id, group_id=group_id)
             
         try:
             await event.bot.api.call_action("send_private_msg", user_id=user_id, message=llm_msg)
         except Exception as e:
             logger.error(f"[QQ群管家] 发送等待审核提示失败: {e}")
 
-        admin_qqs = [q.strip() for q in config.get("admin_qq", "").split(",") if q.strip()]
+        admin_qqs = [
+            q.strip() for q in (config.get("admin_qq") or "").split(",") if q.strip()
+        ]
         if admin_qqs:
             admin_msg = (
                 f"收到新的进群邀请！\n"
@@ -441,25 +684,29 @@ class GroupManager(Star):
         else:
             logger.warning("[QQ群管家] 收到进群邀请，但未配置管理员 QQ，将无法审核！")
 
-        task = asyncio.create_task(self._timeout_task(invite_id, event.bot))
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
+        self._schedule_timeout(invite_id, event.bot)
 
     async def _handle_group_increase(self, event: AstrMessageEvent, raw_msg: dict, config: dict):
         group_id = raw_msg.get("group_id")
         user_id = raw_msg.get("user_id")
-        
+        self_id = raw_msg.get("self_id")
+
+        if self_id is not None and str(user_id) == str(self_id):
+            return
+
         if not self._is_group_managed(group_id, config):
             return
 
         if config.get("welcome_enable", True):
             prompt_template = config.get("welcome_prompt", "")
-            prompt = prompt_template.format(user_id=user_id, group_id=group_id)
-            
-            welcome_msg = await self._generate_llm_response(prompt, group_id, config)
+            prompt = safe_format(prompt_template, user_id=user_id, group_id=group_id)
+
+            welcome_msg = await self._generate_llm_response(prompt, group_id, config, event)
             if not welcome_msg:
                 fallback_template = config.get("welcome_fallback", "欢迎加入群聊！")
-                welcome_msg = fallback_template.format(user_id=user_id, group_id=group_id)
+                welcome_msg = safe_format(
+                    fallback_template, user_id=user_id, group_id=group_id
+                )
                 
             try:
                 await event.bot.api.call_action(
@@ -473,7 +720,10 @@ class GroupManager(Star):
     async def _handle_group_decrease(self, event: AstrMessageEvent, raw_msg: dict, config: dict):
         group_id = raw_msg.get("group_id")
         user_id = raw_msg.get("user_id")
-        
+
+        if raw_msg.get("sub_type") == "kick_me":
+            return
+
         if not self._is_group_managed(group_id, config):
             return
 
@@ -486,10 +736,14 @@ class GroupManager(Star):
                 prompt_template, user_id, group_id, member_name
             )
             
-            farewell_msg = await self._generate_llm_response(prompt, group_id, config)
+            farewell_msg = await self._generate_llm_response(
+                prompt, group_id, config, event
+            )
             if not farewell_msg:
                 fallback_template = config.get("farewell_fallback", "有缘再见。")
-                farewell_msg = fallback_template.format(user_id=user_id, group_id=group_id)
+                farewell_msg = safe_format(
+                    fallback_template, user_id=user_id, group_id=group_id
+                )
                 
             try:
                 await event.bot.api.call_action(
@@ -500,12 +754,46 @@ class GroupManager(Star):
             except Exception as e:
                 logger.error(f"[QQ群管家] 发送送辞消息失败: {e}")
 
-    async def _generate_llm_response(self, prompt: str, group_id: int, config: dict) -> str:
+    async def _resolve_provider_ids(self, event, config: dict) -> list:
+        ids_to_try = []
+        primary_provider_id = (config.get("llm_provider_id") or "").strip()
+        if primary_provider_id:
+            ids_to_try.append(primary_provider_id)
+
+        for key in ("fallback_provider_1", "fallback_provider_2"):
+            provider_id = (config.get(key) or "").strip()
+            if provider_id and provider_id not in ids_to_try:
+                ids_to_try.append(provider_id)
+
+        if ids_to_try:
+            return ids_to_try
+
+        default_id = ""
+        umo = getattr(event, "unified_msg_origin", None) if event is not None else None
         try:
-            primary_provider_id = config.get("llm_provider_id", "").strip()
-            fallback_1 = config.get("fallback_provider_1", "").strip()
-            fallback_2 = config.get("fallback_provider_2", "").strip()
-            persona_id = config.get("llm_persona_id", "").strip()
+            if hasattr(self.context, "get_current_chat_provider_id"):
+                default_id = str(
+                    await self.context.get_current_chat_provider_id(umo) or ""
+                ).strip()
+        except Exception as e:
+            logger.warning(f"[QQ群管家] 获取当前会话模型失败: {e}")
+
+        if not default_id:
+            try:
+                provider = self.context.get_using_provider()
+                if provider is not None:
+                    meta = provider.meta() if hasattr(provider, "meta") else None
+                    default_id = str(getattr(meta, "id", "") or "").strip()
+            except Exception as e:
+                logger.warning(f"[QQ群管家] 获取默认模型失败: {e}")
+
+        return [default_id] if default_id else []
+
+    async def _generate_llm_response(
+        self, prompt: str, group_id: int, config: dict, event=None
+    ) -> str:
+        try:
+            persona_id = (config.get("llm_persona_id") or "").strip()
 
             system_prompt = ""
             if persona_id and persona_id != "系统默认":
@@ -542,45 +830,57 @@ class GroupManager(Star):
                     f"【当前任务】\n{prompt}\n\n"
                     f"(注：请严格遵循上述【系统设定】中的人格、语气和角色扮演要求来完成【当前任务】。)"
                 )
-
-            ids_to_try = []
-            if primary_provider_id:
-                ids_to_try.append(primary_provider_id)
-                
-            for f_id in [fallback_1, fallback_2]:
-                if f_id and f_id not in ids_to_try:
-                    ids_to_try.append(f_id)
-                    
+            ids_to_try = await self._resolve_provider_ids(event, config)
             if not ids_to_try:
-                ids_to_try.append("")
+                logger.error(
+                    "[QQ群管家] 未找到可用的聊天模型，将使用静态兜底文本！"
+                )
+                return ""
 
             for prov_id in ids_to_try:
                 try:
-                    logger.info(f"[QQ群管家] 尝试使用大模型 [{prov_id or '系统默认'}] 生成回复...")
-                    
+                    logger.info(f"[QQ群管家] 尝试使用大模型 [{prov_id}] 生成回复...")
+
                     if hasattr(self.context, "llm_generate"):
                         response = await self.context.llm_generate(
-                            chat_provider_id=prov_id if prov_id else None,
-                            prompt=final_prompt
+                            chat_provider_id=prov_id,
+                            prompt=final_prompt,
                         )
-                        if response and hasattr(response, "completion_text") and response.completion_text.strip():
+                        if (
+                            response
+                            and hasattr(response, "completion_text")
+                            and response.completion_text.strip()
+                        ):
                             return response.completion_text.strip()
                     else:
-                        provider_key = prov_id.split('/')[0] if prov_id else ""
-                        provider = self.context.providers.get(provider_key) or self.context.get_using_provider()
+                        provider_key = prov_id.split("/")[0]
+                        provider = (
+                            self.context.providers.get(provider_key)
+                            or self.context.get_using_provider()
+                        )
                         if provider:
-                            response = await provider.text_chat(prompt=final_prompt, session_id=f"group_manager_{group_id}")
-                            if hasattr(response, "completion_text") and response.completion_text.strip():
+                            response = await provider.text_chat(
+                                prompt=final_prompt,
+                                session_id=f"group_manager_{group_id}",
+                            )
+                            if (
+                                hasattr(response, "completion_text")
+                                and response.completion_text.strip()
+                            ):
                                 return response.completion_text.strip()
-                                
-                    logger.warning(f"[QQ群管家] 模型 [{prov_id or '系统默认'}] 返回了空文本，尝试下一个...")
+
+                    logger.warning(
+                        f"[QQ群管家] 模型 [{prov_id}] 返回了空文本，尝试下一个..."
+                    )
                 except Exception as e:
-                    logger.warning(f"[QQ群管家] 模型 [{prov_id or '系统默认'}] 生成失败: {e}，尝试下一个...")
+                    logger.warning(
+                        f"[QQ群管家] 模型 [{prov_id}] 生成失败: {e}，尝试下一个..."
+                    )
                     continue
 
             logger.error("[QQ群管家] 所有配置的大模型均生成失败，将使用静态兜底文本！")
             return ""
-                
+
         except Exception as e:
             logger.error(f"[QQ群管家] LLM 生成流程发生异常: {e}")
             return ""
