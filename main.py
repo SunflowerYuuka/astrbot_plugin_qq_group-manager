@@ -62,7 +62,7 @@ def build_farewell_prompt(prompt_template: str, user_id, group_id, member_name: 
     )
 
 
-@register("QQ_Group_Manager", "SunflowerYuuka", "QQ群管家插件（AI 辅助制作）：自动处理入群申请、调用LLM迎新送辞、邀请进群审核", "v1.4.0")
+@register("QQ_Group_Manager", "SunflowerYuuka", "QQ群管家插件（AI 辅助制作）：自动处理入群申请、调用LLM迎新送辞、邀请进群审核", "v1.5.0")
 class GroupManager(Star):
     def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
@@ -617,7 +617,7 @@ class GroupManager(Star):
         if not self._is_group_managed(group_id, config):
             return
 
-        if config.get("auto_approve", True):
+        if config.get("auto_approve", False):
             try:
                 await event.bot.api.call_action(
                     "set_group_add_request",
@@ -634,11 +634,25 @@ class GroupManager(Star):
         user_id = raw_msg.get("user_id")
         group_id = raw_msg.get("group_id")
 
+        if not self._is_group_managed(group_id, config):
+            try:
+                await event.bot.api.call_action(
+                    "set_group_add_request",
+                    flag=flag,
+                    sub_type="invite",
+                    approve=False,
+                    reason="该群未开启群管家功能",
+                )
+                logger.info(f"[QQ群管家] 已自动拒绝加入未纳管群 {group_id} 的邀请。")
+            except Exception as e:
+                logger.warning(f"[QQ群管家] 自动拒绝未纳管群邀请失败: {e}")
+            return
+
         if not all((flag, user_id, group_id)):
             logger.warning("[QQ群管家] 收到字段不完整的进群邀请，已忽略。")
             return
 
-        invite_id = uuid.uuid4().hex[:6]
+        invite_id = uuid.uuid4().hex[:12]
         self.pending_invites[invite_id] = {
             "flag": flag,
             "user_id": user_id,
@@ -823,13 +837,6 @@ class GroupManager(Star):
                 except Exception as e:
                     logger.warning(f"[QQ群管家] 获取人格 [{persona_id}] 失败: {e}")
 
-            final_prompt = prompt
-            if system_prompt:
-                final_prompt = (
-                    f"【系统设定/人格要求】\n{system_prompt}\n\n"
-                    f"【当前任务】\n{prompt}\n\n"
-                    f"(注：请严格遵循上述【系统设定】中的人格、语气和角色扮演要求来完成【当前任务】。)"
-                )
             ids_to_try = await self._resolve_provider_ids(event, config)
             if not ids_to_try:
                 logger.error(
@@ -842,10 +849,13 @@ class GroupManager(Star):
                     logger.info(f"[QQ群管家] 尝试使用大模型 [{prov_id}] 生成回复...")
 
                     if hasattr(self.context, "llm_generate"):
-                        response = await self.context.llm_generate(
-                            chat_provider_id=prov_id,
-                            prompt=final_prompt,
-                        )
+                        generate_kwargs = {
+                            "chat_provider_id": prov_id,
+                            "prompt": prompt,
+                        }
+                        if system_prompt:
+                            generate_kwargs["system_prompt"] = system_prompt
+                        response = await self.context.llm_generate(**generate_kwargs)
                         if (
                             response
                             and hasattr(response, "completion_text")
@@ -859,8 +869,14 @@ class GroupManager(Star):
                             or self.context.get_using_provider()
                         )
                         if provider:
+                            fallback_prompt = prompt
+                            if system_prompt:
+                                fallback_prompt = (
+                                    f"【系统设定/人格要求】\n{system_prompt}\n\n"
+                                    f"【当前任务】\n{prompt}"
+                                )
                             response = await provider.text_chat(
-                                prompt=final_prompt,
+                                prompt=fallback_prompt,
                                 session_id=f"group_manager_{group_id}",
                             )
                             if (

@@ -171,6 +171,28 @@ def test_member_card_cache_is_disabled_by_default():
     assert schema["member_card_cache_refresh_interval"]["default"] == 60
 
 
+def test_auto_approve_is_disabled_by_default():
+    schema_path = Path(__file__).parents[1] / "_conf_schema.json"
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+
+    assert schema["auto_approve"]["default"] is False
+
+
+def test_missing_auto_approve_config_does_not_approve_join_request():
+    manager = make_manager()
+    bot = FakeBot()
+
+    asyncio.run(
+        manager._handle_group_add(
+            FakeEvent(bot),
+            {"group_id": 1001, "user_id": 123456, "flag": "flag-1"},
+            {},
+        )
+    )
+
+    assert not [call for call in bot.api.calls if call[0] == "set_group_add_request"]
+
+
 def test_auto_approve_enabled_still_approves_join_request():
     manager = make_manager()
     bot = FakeBot()
@@ -222,6 +244,32 @@ def test_farewell_skips_kick_me():
     )
 
     assert not [call for call in bot.api.calls if call[0] == "send_group_msg"]
+
+
+def test_blacklisted_group_invite_is_rejected_without_admin_notice():
+    manager = make_manager()
+    bot = FakeBot()
+
+    asyncio.run(
+        manager._handle_group_invite(
+            FakeEvent(bot),
+            {"flag": "flag-1", "user_id": 123456, "group_id": 2002},
+            {
+                "filter_list_mode": "白名单",
+                "filter_group_list": [1001],
+                "admin_qq": "999",
+            },
+        )
+    )
+
+    actions = [call[0] for call in bot.api.calls]
+    assert "set_group_add_request" in actions
+    reject_call = [
+        call for call in bot.api.calls if call[0] == "set_group_add_request"
+    ][0]
+    assert reject_call[1]["approve"] is False
+    assert "send_private_msg" not in actions
+    assert manager.pending_invites == {}
 
 
 def test_approve_deletes_pending_even_if_notification_fails():
@@ -408,6 +456,47 @@ def test_configured_providers_keep_priority_order():
             },
         )
     ) == ["main", "backup1", "backup2"]
+
+
+def test_blacklist_mode_rejects_invite_for_listed_group():
+    manager = make_manager()
+    bot = FakeBot()
+
+    asyncio.run(
+        manager._handle_group_invite(
+            FakeEvent(bot),
+            {"flag": "flag-1", "user_id": 123456, "group_id": 1001},
+            {
+                "filter_list_mode": "黑名单",
+                "filter_group_list": [1001],
+                "admin_qq": "999",
+            },
+        )
+    )
+
+    reject_call = [
+        call for call in bot.api.calls if call[0] == "set_group_add_request"
+    ][0]
+    assert reject_call[1]["approve"] is False
+    assert manager.pending_invites == {}
+
+
+def test_invite_id_is_twelve_characters():
+    manager = make_manager()
+    bot = FakeBot()
+    manager._schedule_timeout = lambda *_args, **_kwargs: None
+
+    asyncio.run(
+        manager._handle_group_invite(
+            FakeEvent(bot),
+            {"flag": "flag-1", "user_id": 123456, "group_id": 1001},
+            {"filter_list_mode": "黑名单", "filter_group_list": [], "admin_qq": ""},
+        )
+    )
+
+    assert len(manager.pending_invites) == 1
+    invite_id = next(iter(manager.pending_invites))
+    assert len(invite_id) == 12
 
 
 def test_startup_timeout_rebuild_schedules_pending_invites():

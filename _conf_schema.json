@@ -35,8 +35,9 @@
   },
   "auto_approve": {
     "description": "自动同意路人入群申请",
+    "hint": "默认关闭。开启后机器人会自动同意所有入群申请，存在被批量拉群的风险，请谨慎启用。",
     "type": "bool",
-    "default": true
+    "default": false
   },
   "invite_prompt": {
     "description": "邀请进群等待提示词 (LLM)",
